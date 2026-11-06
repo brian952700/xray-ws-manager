@@ -29,13 +29,20 @@ main() (
     trap 'rm -rf -- "$temp"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    printf '正在下载 xy 管理脚本…\n'
+    local title= reset=
+    if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
+        title=$'\033[1;36m'; reset=$'\033[0m'
+    fi
+    printf '\n%s  XY · 节点管理%s\n' "$title" "$reset"
+    printf '  VLESS + WebSocket + TLS\n'
+    printf '  ------------------------------------------\n\n'
+    printf '  正在下载并检查管理脚本…\n'
     curl --fail --show-error --location --proto '=https' --tlsv1.2 \
         --retry 3 --connect-timeout 20 --max-time 300 "$url" -o "$temp/xy.sh"
     [[ -s $temp/xy.sh ]] || { printf '错误：下载的脚本为空。\n' >&2; exit 1; }
     bash -n "$temp/xy.sh"
     "${elevate[@]}" install -o root -g root -m 0755 "$temp/xy.sh" "$target"
-    printf '安装完成。以后使用 sudo xy（root 用户直接输入 xy）打开菜单。\n'
+    printf '\n  [OK] 管理脚本已就绪。以后使用 sudo xy 打开菜单。\n\n'
     "${elevate[@]}" "$target" </dev/tty
 )
 
