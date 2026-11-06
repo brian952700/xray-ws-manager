@@ -84,7 +84,7 @@ def manager(code, check_result=True):
 def proxy_test(uuid):
     # Build the client from the exported URI, including encryption and WS/TLS parameters.
     links = subprocess.check_output(['bash', '-c', 'source /usr/local/bin/xy; list_users'], text=True)
-    link = next(line.removeprefix('链接：') for line in links.splitlines() if line.startswith('链接：'))
+    link = next(line for line in links.splitlines() if line.startswith('vless://'))
     parsed = urlsplit(link)
     params = parse_qs(parsed.query)
     check('URI uses VLESS and expected UUID', parsed.scheme == 'vless' and parsed.username == uuid)
@@ -134,6 +134,36 @@ def main():
     run('shellcheck', '--severity=error', str(ROOT / 'xy.sh'), str(ROOT / 'install.sh'))
     check('Bash syntax and ShellCheck error-level checks', True)
 
+    # Exercise real terminal capabilities and an early failure inside a function.
+    ui_command = 'source /workspace/xy.sh; heading "UI"; success "ready"; warn "notice"'
+    plain = run('bash', '-c', ui_command, capture_output=True)
+    check('redirected output has no ANSI escapes', '\x1b' not in plain.stdout + plain.stderr)
+    for extra_env, colored in (({'TERM': 'xterm'}, True),
+                               ({'TERM': 'xterm', 'NO_COLOR': ''}, False),
+                               ({'TERM': 'dumb'}, False)):
+        ui_env = dict(os.environ)
+        ui_env.pop('NO_COLOR', None)
+        ui_env.update(extra_env)
+        terminal = pexpect.spawn('bash', ['-c', ui_command], env=ui_env, encoding='utf-8')
+        terminal.expect(pexpect.EOF)
+        output = terminal.before
+        terminal.close()
+        check('terminal color capability: ' + repr(extra_env), ('\x1b[' in output) == colored)
+    failure = run('bash', '-c', '''source /workspace/xy.sh
+set -e
+failing_step() { echo deliberate-ui-failure; false; touch /tmp/xy-should-not-run; }
+run_logged 'CI failure' failing_step
+touch /tmp/xy-should-not-continue
+''', check=False, capture_output=True)
+    check('quiet logging preserves errexit and exposes failure details',
+          failure.returncode != 0 and 'deliberate-ui-failure' in failure.stderr
+          and '完整日志：' in failure.stderr
+          and not Path('/tmp/xy-should-not-run').exists()
+          and not Path('/tmp/xy-should-not-continue').exists())
+    for log in Path('/tmp').glob('xy-operation.*'):
+        check('failure log is private', log.stat().st_mode & 0o777 == 0o600)
+        log.unlink()
+
     FIXTURE.mkdir(parents=True)
     (FIXTURE / 'ci.example.test.conf').touch()
     certificate()
@@ -155,9 +185,21 @@ def main():
     # Execute exactly the README one-command pipeline inside a controlling PTY.
     child = spawn('bash', ['-o', 'pipefail', '-c', f'curl -fsSL {RAW}install.sh | bash'])
     child.expect_exact('请输入域名（已解析到本服务器）：')
+    child.sendline('https://invalid.example')
+    child.expect_exact('域名格式错误')
+    child.expect_exact('请输入域名（已解析到本服务器）：')
     child.sendline('ci.example.test')
     child.expect_exact('监听端口 [443]：')
+    child.sendline('80')
+    child.expect_exact('保留 80 给证书验证')
+    child.expect_exact('监听端口 [443]：')
+    child.sendline('not-a-port')
+    child.expect_exact('端口必须是')
+    child.expect_exact('监听端口 [443]：')
     child.sendline('8443')
+    child.expect_exact('WebSocket 路径 [/]：')
+    child.sendline('invalid-path')
+    child.expect_exact('路径须以 / 开头，且不包含')
     child.expect_exact('WebSocket 路径 [/]：')
     child.sendline('/ci')
     child.expect_exact('安装/更新完成；证书续期回调已注册。')
@@ -171,7 +213,7 @@ def main():
     check('server uses WebSocket only', content()['inbounds'][0]['streamSettings']['network'] == 'ws' and 'xhttpSettings' not in content()['inbounds'][0]['streamSettings'])
     check('Flow remains empty', not content()['inbounds'][0]['settings'].get('flow'))
     links = subprocess.check_output(['bash', '-c', 'source /usr/local/bin/xy; list_users'], text=True)
-    link = next(line.removeprefix('链接：') for line in links.splitlines() if line.startswith('链接：'))
+    link = next(line for line in links.splitlines() if line.startswith('vless://'))
     check('share link carries matching encryption', parse_qs(urlsplit(link).query)['encryption'][0] == content()['_xy']['vlessEncryption'])
     check('share link never exposes server private parameter', content()['inbounds'][0]['settings']['decryption'] not in links)
     admin = content()['inbounds'][0]['settings']['clients'][0]['id']
@@ -265,10 +307,14 @@ def main():
     child.expect_exact('请输入新域名 [ci.example.test]：')
     child.sendline('https://invalid.example')
     child.expect_exact('域名格式错误')
-    resume(child)
-    check('invalid domain preserves node and certificates',
+    child.expect_exact('请输入新域名 [ci.example.test]：')
+    check('invalid domain retry preserves node and certificates',
           CONFIG.read_bytes() == before_config and domain_file.read_bytes() == before_domain
           and digest(CERT) == before_cert and digest(KEY) == before_key and active())
+    child.sendline('')
+    child.expect_exact('域名和证书更新完成')
+    resume(child)
+    before_cert, before_key = digest(CERT), digest(KEY)
 
     # Request a domain whose fixture deliberately holds a different domain's certificate.
     bad_fixture = Path('/etc/xray-cert/acme/wrong.example.test_ecc')
@@ -325,7 +371,7 @@ def main():
     check('stale domain callback cannot replace active identity',
           digest(CERT) == new_cert and digest(KEY) == new_key and active())
     links = subprocess.check_output(['bash', '-c', 'source /usr/local/bin/xy; list_users'], text=True)
-    link = next(line.removeprefix('链接：') for line in links.splitlines() if line.startswith('链接：'))
+    link = next(line for line in links.splitlines() if line.startswith('vless://'))
     check('new links use updated address and SNI', urlsplit(link).hostname == 'new.example.test'
           and parse_qs(urlsplit(link).query)['sni'] == ['new.example.test'])
 
